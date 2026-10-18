@@ -168,6 +168,8 @@ int main(int argc, char *argv[])
 		usage();
 	}
 
+	int times = (argc >= 3) ? atoi(argv[2]) : 1;
+
 	nf = open_file(argv[1], O_RDONLY);
 	if (nf == NULL) {
 		fprintf(stderr, "Failed to open %s\n", argv[1]);
@@ -178,20 +180,22 @@ int main(int argc, char *argv[])
 		exit(10);
 	}
 
-	off = 0;
-	while (off < st.nfs_size) {
-		count = st.nfs_size - off;
-		if (count > BUFSIZE) {
-			count = BUFSIZE;
+	while (times--) {
+		off = 0;
+		while (off < st.nfs_size) {
+			count = st.nfs_size - off;
+			if (count > BUFSIZE) {
+				count = BUFSIZE;
+			}
+			count = nfs_pread(nf->nfs, nf->nfsfh, off, count, buf);
+			if (count < 0) {
+				fprintf(stderr, "Failed to read from file\n");
+				free_file_context(nf);
+				return 10;
+			}
+			fwrite(buf, count, 1, stdout);
+			off += count;
 		}
-		count = nfs_pread(nf->nfs, nf->nfsfh, off, count, buf);
-		if (count < 0) {
-			fprintf(stderr, "Failed to read from file\n");
-			free_file_context(nf);
-			return 10;
-		}
-		fwrite(buf, count, 1, stdout);
-		off += count;
 	}
 
 	free_file_context(nf);
