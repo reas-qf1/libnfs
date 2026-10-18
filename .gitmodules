@@ -1,0 +1,4 @@
+[submodule "userspace/lwip"]
+	path = userspace/lwip
+	url = https://github.com/lwip-tcpip/lwip.git
+	branch = STABLE-2_2_1_RELEASE

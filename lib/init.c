@@ -49,6 +49,7 @@
 #include "libnfs.h"
 #include "libnfs-raw.h"
 #include "libnfs-private.h"
+#include "nfs-net.h"
 
 int rpc_current_time(void)
 {
@@ -366,7 +367,7 @@ void rpc_destroy_context(struct rpc_context *rpc)
         }
 
 	if (rpc->fd != -1) {
- 		close(rpc->fd);
+ 		nfs_net_close(rpc->fd);
 	}
 
 	if (rpc->error_string != NULL) {

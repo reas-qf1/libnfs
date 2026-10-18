@@ -96,6 +96,7 @@
 #include "libnfs-raw-mount.h"
 #include "libnfs-raw-nfs.h"
 #include "libnfs-private.h"
+#include "nfs-net.h"
 
 struct sync_cb_data {
 	int is_finished;
@@ -120,7 +121,7 @@ static void wait_for_reply(struct rpc_context *rpc, struct sync_cb_data *cb_data
 		pfd.fd = rpc_get_fd(rpc);
 		pfd.events = rpc_which_events(rpc);
 
-		ret = poll(&pfd, 1, 100);
+		ret = nfs_net_poll(&pfd, 1, 100);
 		if (ret < 0) {
 			rpc_set_error(rpc, "Poll failed");
 			revents = -1;
@@ -153,7 +154,7 @@ static void wait_for_nfs_reply(struct nfs_context *nfs, struct sync_cb_data *cb_
 		pfd.fd = nfs_get_fd(nfs);
 		pfd.events = nfs_which_events(nfs);
 
-		ret = poll(&pfd, 1, 100);
+		ret = nfs_net_poll(&pfd, 1, 100);
 		if (ret < 0) {
 			nfs_set_error(nfs, "Poll failed");
 			revents = -1;
@@ -1736,7 +1737,7 @@ struct nfs_server_list *nfs_find_local_servers(void)
       -    (tv_current.tv_sec *1000 + tv_current.tv_usec / 1000)
       +    (tv_start.tv_sec *1000 + tv_start.tv_usec / 1000);
 
-      if (poll(&pfd, 1, mpt) < 0)
+      if (nfs_net_poll(&pfd, 1, mpt) < 0)
       {
         free_nfs_srvr_list(data.srvrs);
         rpc_destroy_context(rpc);
@@ -1877,7 +1878,7 @@ struct nfs_server_list *nfs_find_local_servers(void)
 			-    (tv_current.tv_sec *1000 + tv_current.tv_usec / 1000)
 			+    (tv_start.tv_sec *1000 + tv_start.tv_usec / 1000);
 
-			if (poll(&pfd, 1, mpt) < 0) {
+			if (nfs_net_poll(&pfd, 1, mpt) < 0) {
 				free_nfs_srvr_list(data.srvrs);
 				rpc_destroy_context(rpc);
 				return NULL;

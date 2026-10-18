@@ -224,10 +224,16 @@ AC_CHECK_MEMBERS([struct stat.st_mtim.tv_nsec])
 # check where makedev is defined
 AC_HEADER_MAJOR
 
+# The user-space TCP/IP stack (lwIP over TUN, driven by io_uring) is the only
+# network backend in this fork, so it is always built.
+AC_CHECK_LIB([uring], [io_uring_queue_init], [],
+             [AC_MSG_ERROR([liburing is required to build this fork])])
+
 #output
 AC_CONFIG_FILES([Makefile]
                 [doc/Makefile]
                 [include/Makefile]
+                [userspace/Makefile]
                 [lib/Makefile]
                 [mount/Makefile]
                 [nfs/Makefile]

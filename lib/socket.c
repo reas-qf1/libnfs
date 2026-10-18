@@ -78,6 +78,7 @@
 #include "libnfs.h"
 #include "libnfs-raw.h"
 #include "libnfs-private.h"
+#include "nfs-net.h"
 #include "slist.h"
 
 #ifdef WIN32
@@ -87,39 +88,12 @@
 
 static int rpc_reconnect_requeue(struct rpc_context *rpc);
 
-static int create_socket(int domain, int type, int protocol)
-{
-#ifdef SOCK_CLOEXEC
-	/* Linux-specific extension (since 2.6.27): set the
-	   close-on-exec flag on all sockets to avoid leaking file
-	   descriptors to child processes */
-	int fd = socket(domain, type|SOCK_CLOEXEC, protocol);
-	if (fd >= 0 || errno != EINVAL)
-		return fd;
-#endif
-
-	return socket(domain, type, protocol);
-}
-
-static int set_nonblocking(int fd)
-{
-	int v = 0;
-#if defined(WIN32)
-	u_long nonblocking=1;
-	v = ioctl(fd, FIONBIO, &nonblocking);
-#else
-	v = fcntl(fd, F_GETFL, 0);
-	v = fcntl(fd, F_SETFL, v | O_NONBLOCK);
-#endif //FIXME
-	return v;
-}
-
 static void set_nolinger(int fd)
 {
 	struct linger lng;
 	lng.l_onoff = 1;
 	lng.l_linger = 0;
-	setsockopt(fd, SOL_SOCKET, SO_LINGER, (char *)&lng, sizeof(lng));
+	nfs_net_setsockopt(fd, SOL_SOCKET, SO_LINGER, (char *)&lng, sizeof(lng));
 }
 
 static int set_bind_device(int fd, char *ifname)
@@ -128,7 +102,7 @@ static int set_bind_device(int fd, char *ifname)
 
 #ifdef HAVE_SO_BINDTODEVICE
 	if (*ifname) {
-		rc = setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
+		rc = nfs_net_setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
 	}
 
 #endif
@@ -151,7 +125,7 @@ static int set_tcp_sockopt(int sockfd, int optname, int value)
 		level = SOL_TCP;
 	#endif
 
-	return setsockopt(sockfd, level, optname, (char *)&value, sizeof(value));
+	return nfs_net_setsockopt(sockfd, level, optname, (char *)&value, sizeof(value));
 }
 #endif
 
@@ -207,7 +181,7 @@ static int rpc_write_to_socket(struct rpc_context *rpc)
 
 		total = pdu->outdata.size;
 
-		count = send(rpc->fd, pdu->outdata.data + pdu->written, (int)(total - pdu->written), 0);
+		count = nfs_net_send(rpc->fd, pdu->outdata.data + pdu->written, (int)(total - pdu->written), 0);
 		if (count == -1) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				return 0;
@@ -254,7 +228,7 @@ static int rpc_read_from_socket(struct rpc_context *rpc)
 			rpc_set_error(rpc, "Failed to malloc buffer for recvfrom");
 			return -1;
 		}
-		count = recvfrom(rpc->fd, buf, MAX_UDP_SIZE, MSG_DONTWAIT, (struct sockaddr *)&rpc->udp_src, &socklen);
+		count = nfs_net_recvfrom(rpc->fd, buf, MAX_UDP_SIZE, MSG_DONTWAIT, (struct sockaddr *)&rpc->udp_src, &socklen);
 		if (count == -1) {
 			free(buf);
 			if (errno == EINTR || errno == EAGAIN) {
@@ -294,7 +268,7 @@ static int rpc_read_from_socket(struct rpc_context *rpc)
 			buf = rpc->inbuf;
 		}
 
-		count = recv(rpc->fd, buf + rpc->inpos, pdu_size - rpc->inpos, MSG_DONTWAIT);
+		count = nfs_net_recv(rpc->fd, buf + rpc->inpos, pdu_size - rpc->inpos, MSG_DONTWAIT);
 		if (count < 0) {
 			if (errno == EINTR || errno == EAGAIN) {
 				break;
@@ -404,7 +378,7 @@ int rpc_service(struct rpc_context *rpc, int revents)
 #endif
 			socklen_t err_size = sizeof(err);
 
-			if (getsockopt(rpc->fd, SOL_SOCKET, SO_ERROR,
+			if (nfs_net_getsockopt(rpc->fd, SOL_SOCKET, SO_ERROR,
 				(char *)&err, &err_size) != 0 || err != 0) {
 				if (err == 0) {
 					err = errno;
@@ -432,7 +406,7 @@ int rpc_service(struct rpc_context *rpc, int revents)
 		int err = 0;
 		socklen_t err_size = sizeof(err);
 
-		if (getsockopt(rpc->fd, SOL_SOCKET, SO_ERROR,
+		if (nfs_net_getsockopt(rpc->fd, SOL_SOCKET, SO_ERROR,
 				(char *)&err, &err_size) != 0 || err != 0) {
 			if (err == 0) {
 				err = errno;
@@ -507,7 +481,7 @@ static int rpc_connect_sockaddr_async(struct rpc_context *rpc)
 	switch (s->ss_family) {
 	case AF_INET:
 		socksize = sizeof(struct sockaddr_in);
-		rpc->fd = create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		rpc->fd = nfs_net_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (set_bind_device(rpc->fd, rpc->ifname) != 0) {
 			rpc_set_error (rpc, "Failed to bind to interface");
 			return -1;
@@ -521,7 +495,7 @@ static int rpc_connect_sockaddr_async(struct rpc_context *rpc)
 		break;
 	case AF_INET6:
 		socksize = sizeof(struct sockaddr_in6);
-		rpc->fd = create_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+		rpc->fd = nfs_net_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
 		if (set_bind_device(rpc->fd, rpc->ifname) != 0) {
 			rpc_set_error (rpc, "Failed to bind to interface");
 			return -1;
@@ -544,10 +518,10 @@ static int rpc_connect_sockaddr_async(struct rpc_context *rpc)
 	}
 
 	if (rpc->old_fd) {
-		if (dup2(rpc->fd, rpc->old_fd) == -1) {
+		if (nfs_net_dup2(rpc->fd, rpc->old_fd) == -1) {
 			return -1;
 		}
-		close(rpc->fd);
+		nfs_net_close(rpc->fd);
 		rpc->fd = rpc->old_fd;
 	}
 
@@ -606,7 +580,7 @@ static int rpc_connect_sockaddr_async(struct rpc_context *rpc)
 					break;
 				}
 
-				rc = bind(rpc->fd, (struct sockaddr *)&ss, socksize);
+				rc = nfs_net_bind(rpc->fd, (struct sockaddr *)&ss, socksize);
 #if !defined(WIN32)
 				/* we got EACCES, so don't try again */
 				if (rc != 0 && errno == EACCES)
@@ -616,10 +590,10 @@ static int rpc_connect_sockaddr_async(struct rpc_context *rpc)
 		} while (rc != 0 && portOfs != startOfs);
 	}
 
-	rpc->is_nonblocking = !set_nonblocking(rpc->fd);
+	rpc->is_nonblocking = !nfs_net_set_nonblocking(rpc->fd);
 	set_nolinger(rpc->fd);
 
-	if (connect(rpc->fd, (struct sockaddr *)s, socksize) != 0 && errno != EINPROGRESS) {
+	if (nfs_net_connect(rpc->fd, (struct sockaddr *)s, socksize) != 0 && errno != EINPROGRESS) {
 		rpc_set_error(rpc, "connect() to server failed. %s(%d)", strerror(errno), errno);
 		return -1;
 	}
@@ -632,7 +606,7 @@ static int rpc_set_sockaddr(struct rpc_context *rpc, const char *server,
 {
 	struct addrinfo *ai = NULL;
 
-	if (getaddrinfo(server, NULL, NULL, &ai) != 0) {
+	if (nfs_net_getaddrinfo(server, NULL, NULL, &ai) != 0) {
 		rpc_set_error(rpc, "Invalid address:%s. "
 			      "Can not resolv into IPv4/v6 structure.", server);
 		return -1;
@@ -656,7 +630,7 @@ static int rpc_set_sockaddr(struct rpc_context *rpc, const char *server,
 #endif
 		break;
 	}
-	freeaddrinfo(ai);
+	nfs_net_freeaddrinfo(ai);
 
         return 0;
 }
@@ -708,7 +682,7 @@ int rpc_disconnect(struct rpc_context *rpc, const char *error)
 	rpc_set_autoreconnect(rpc, 0);
 
 	if (rpc->fd != -1) {
-		close(rpc->fd);
+		nfs_net_close(rpc->fd);
 	}
 	rpc->fd  = -1;
 
@@ -809,7 +783,7 @@ int rpc_bind_udp(struct rpc_context *rpc, char *addr, int port)
 	}
 
 	sprintf(service, "%d", port);
-	if (getaddrinfo(addr, service, NULL, &ai) != 0) {
+	if (nfs_net_getaddrinfo(addr, service, NULL, &ai) != 0) {
 		rpc_set_error(rpc, "Invalid address:%s. "
 			      "Can not resolv into IPv4/v6 structure.", addr);
 		return -1;
@@ -817,26 +791,26 @@ int rpc_bind_udp(struct rpc_context *rpc, char *addr, int port)
 
 	switch(ai->ai_family) {
 	case AF_INET:
-		rpc->fd = create_socket(ai->ai_family, SOCK_DGRAM, 0);
+		rpc->fd = nfs_net_socket(ai->ai_family, SOCK_DGRAM, 0);
 		if (rpc->fd == -1) {
 			rpc_set_error(rpc, "Failed to create UDP socket: %s", strerror(errno));
-			freeaddrinfo(ai);
+			nfs_net_freeaddrinfo(ai);
 			return -1;
 		}
 
-		if (bind(rpc->fd, (struct sockaddr *)ai->ai_addr, sizeof(struct sockaddr_in)) != 0) {
+		if (nfs_net_bind(rpc->fd, (struct sockaddr *)ai->ai_addr, sizeof(struct sockaddr_in)) != 0) {
 			rpc_set_error(rpc, "Failed to bind to UDP socket: %s",strerror(errno));
-			freeaddrinfo(ai);
+			nfs_net_freeaddrinfo(ai);
 			return -1;
 		}
 		break;
 	default:
 		rpc_set_error(rpc, "Can not handle UPD sockets of family %d yet", ai->ai_family);
-		freeaddrinfo(ai);
+		nfs_net_freeaddrinfo(ai);
 		return -1;
 	}
 
-	freeaddrinfo(ai);
+	nfs_net_freeaddrinfo(ai);
 
 	return 0;
 }
@@ -854,17 +828,17 @@ int rpc_set_udp_destination(struct rpc_context *rpc, char *addr, int port, int i
 	}
 
 	sprintf(service, "%d", port);
-	if (getaddrinfo(addr, service, NULL, &ai) != 0) {
+	if (nfs_net_getaddrinfo(addr, service, NULL, &ai) != 0) {
 		rpc_set_error(rpc, "Invalid address:%s. "
 			      "Can not resolv into IPv4/v6 structure.", addr);
 		return -1;
  	}
 
 	memcpy(&rpc->udp_dest, ai->ai_addr, ai->ai_addrlen);
-	freeaddrinfo(ai);
+	nfs_net_freeaddrinfo(ai);
 
 	rpc->is_broadcast = is_broadcast;
-	setsockopt(rpc->fd, SOL_SOCKET, SO_BROADCAST, (char *)&is_broadcast, sizeof(is_broadcast));
+	nfs_net_setsockopt(rpc->fd, SOL_SOCKET, SO_BROADCAST, (char *)&is_broadcast, sizeof(is_broadcast));
 
 	return 0;
 }
@@ -908,6 +882,6 @@ int rpc_is_udp_socket(struct rpc_context *rpc)
 #endif
         socklen_t len = sizeof(type);
 
-        getsockopt(rpc->fd, SOL_SOCKET, SO_TYPE, &type, &len);
+        nfs_net_getsockopt(rpc->fd, SOL_SOCKET, SO_TYPE, &type, &len);
         return type == SOCK_DGRAM;
 }

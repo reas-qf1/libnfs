@@ -34,5 +34,6 @@ libnfs_la_LIBADD = \
 	../nlm/libnlm.la \
 	../nsm/libnsm.la \
 	../portmap/libportmap.la \
-	../rquota/librquota.la 
+	../rquota/librquota.la \
+	../userspace/liblwip.la
 
