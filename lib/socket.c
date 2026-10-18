@@ -192,7 +192,6 @@ int rpc_which_events(struct rpc_context *rpc)
 
 static int rpc_write_to_socket(struct rpc_context *rpc)
 {
-	int32_t count;
 	struct rpc_pdu *pdu;
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
@@ -202,54 +201,49 @@ static int rpc_write_to_socket(struct rpc_context *rpc)
 		return -1;
 	}
 
-	while ((pdu = rpc->outqueue.head) != NULL) {
-		int64_t total;
+	for (pdu = rpc->outqueue.head; pdu; pdu = pdu->next) {
+		int64_t left = (int64_t)pdu->outdata.size - pdu->written;
+		if (left <= 0)
+			continue;
 
-		total = pdu->outdata.size;
-
-		count = send(rpc->fd, pdu->outdata.data + pdu->written, (int)(total - pdu->written), 0);
-		if (count == -1) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				return 0;
-			}
-			rpc_set_error(rpc, "Error when writing to socket :%s(%d)", strerror(errno), errno);
-			return -1;
-		}
-
-		pdu->written += count;
-		if (pdu->written == total) {
-			unsigned int hash;
-
-			rpc->outqueue.head = pdu->next;
-			if (pdu->next == NULL)
-				rpc->outqueue.tail = NULL;
-
-                        if (pdu->flags & PDU_DISCARD_AFTER_SENDING) {
-                                rpc_free_pdu(rpc, pdu);
-                                return 0;
-                        }
-
-			hash = rpc_hash_xid(pdu->xid);
-			rpc_enqueue(&rpc->waitpdu[hash], pdu);
-			rpc->waitpdu_len++;
-		}
+		struct io_uring_sqe *sqe = io_uring_get_sqe(&rpc->ring);
+		if (!sqe)
+			break;
+		io_uring_prep_send(sqe, rpc->fd, pdu->outdata.data + pdu->written, (int)left, 0);
+		io_uring_sqe_set_data(sqe, pdu);
+		rpc->outgoing_calls++;
 	}
+	return 0;
+}
+
+static int rpc_write_complete(struct rpc_context *rpc, struct io_uring_cqe *cqe) {
+	struct rpc_pdu *p = io_uring_cqe_get_data(cqe);
+	int32_t count = cqe->res;
+	io_uring_cqe_seen(&rpc->ring, cqe);
+
+	if (count < 0) {
+		if (count == -EINTR || count == -EAGAIN || count == -EWOULDBLOCK) {
+			return 0;
+		}
+		rpc_set_error(rpc, "Error when writing to socket :%s(%d)", strerror(-count), -count);
+		return -1;
+	}
+
+	p->written += count;
 	return 0;
 }
 
 #define MAX_UDP_SIZE 65536
 static int rpc_read_from_socket(struct rpc_context *rpc)
 {
-	uint32_t pdu_size;
 	ssize_t count;
-	char *buf;
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
 	if (rpc->is_udp) {
 		socklen_t socklen = sizeof(rpc->udp_src);
 
-		buf = malloc(MAX_UDP_SIZE);
+		char *buf = malloc(MAX_UDP_SIZE);
 		if (buf == NULL) {
 			rpc_set_error(rpc, "Failed to malloc buffer for recvfrom");
 			return -1;
@@ -272,60 +266,56 @@ static int rpc_read_from_socket(struct rpc_context *rpc)
 		return 0;
 	}
 
-	do {
-		/* read record marker, 4 bytes at the beginning of every pdu first */
-		if (rpc->inpos < 4) {
-			buf = (void *)rpc->rm_buf;
-			pdu_size = 4;
-		} else {
-			pdu_size = rpc_get_pdu_size((void *)&rpc->rm_buf);
-			if (rpc->inbuf == NULL) {
-				if (pdu_size > NFS_MAX_XFER_SIZE + 4096) {
-					rpc_set_error(rpc, "Incoming PDU exceeds limit of %d bytes.", NFS_MAX_XFER_SIZE + 4096);
-					return -1;
-				}
-				rpc->inbuf = malloc(pdu_size);
-				if (rpc->inbuf == NULL) {
-					rpc_set_error(rpc, "Failed to allocate buffer of %d bytes for pdu, errno:%d. Closing socket.", pdu_size, errno);
-					return -1;
-				}
-				memcpy(rpc->inbuf, &rpc->rm_buf, 4);
-			}
-			buf = rpc->inbuf;
+	if (rpc->is_server_context || rpc->waitpdu_len > 0) {
+		struct io_uring_sqe *sqe = io_uring_get_sqe(&rpc->ring);
+		if (!sqe) {
+			return 0;
 		}
+		io_uring_prep_recv(sqe, rpc->fd, rpc->inbuf + rpc->inpos, NFS_MAX_XFER_SIZE + 4096 - rpc->inpos, MSG_DONTWAIT);
+		io_uring_sqe_set_data64(sqe, 0);
+		rpc->outgoing_calls++;
+	}
+	return 0;
+}
 
-		count = recv(rpc->fd, buf + rpc->inpos, pdu_size - rpc->inpos, MSG_DONTWAIT);
-		if (count < 0) {
-			if (errno == EINTR || errno == EAGAIN) {
-				break;
-			}
-			rpc_set_error(rpc, "Read from socket failed, errno:%d. Closing socket.", errno);
+static int rpc_read_complete(struct rpc_context *rpc, struct io_uring_cqe *cqe) {
+	int count = cqe->res;
+	io_uring_cqe_seen(&rpc->ring, cqe);
+	if (count < 0) {
+		if (count == -EINTR || count == -EAGAIN) {
+			return 0;
+		}
+		rpc_set_error(rpc, "Read from socket failed, errno:%d. Closing socket.", -count);
+		return -1;
+	}
+	if (count == 0) {
+		/* remote side has closed the socket. Reconnect. */
+		return -1;
+	}
+	rpc->inpos += count;
+
+	uint32_t pos = 0;
+	while (rpc->inpos - pos >= 4) {
+		uint32_t pdu_size = rpc_get_pdu_size((void *)(rpc->inbuf + pos));
+		if (pdu_size > NFS_MAX_XFER_SIZE + 4096) {
+			rpc_set_error(rpc, "Incoming PDU exceeds limit of %d bytes.", NFS_MAX_XFER_SIZE + 4096);
 			return -1;
 		}
-		if (count == 0) {
-			/* remote side has closed the socket. Reconnect. */
-			return -1;
-		}
-		rpc->inpos += count;
-
-		if (rpc->inpos == 4) {
-			/* we have just read the header there is likely more data available */
-			continue;
-		}
-
-		if (rpc->inpos == pdu_size) {
-			rpc->inbuf  = NULL;
-			rpc->inpos  = 0;
-
-			if (rpc_process_pdu(rpc, buf, pdu_size) != 0) {
+		if (pos + pdu_size <= rpc->inpos) {
+			if (rpc_process_pdu(rpc, rpc->inbuf + pos, pdu_size) != 0) {
 				rpc_set_error(rpc, "Invalid/garbage pdu received from server. Closing socket");
-				free(buf);
 				return -1;
 			}
-			free(buf);
+			pos += pdu_size;
+		} else {
+			break;
 		}
-	} while (rpc->is_nonblocking && rpc->waitpdu_len > 0);
+	}
 
+	if (pos < rpc->inpos && pos > 0) {
+		memmove(rpc->inbuf, rpc->inbuf + pos, rpc->inpos - pos);
+	}
+	rpc->inpos -= pos;
 	return 0;
 }
 
@@ -452,21 +442,87 @@ int rpc_service(struct rpc_context *rpc, int revents)
 
 	if (revents & POLLIN) {
 		if (rpc_read_from_socket(rpc) != 0) {
-                        if (rpc->is_server_context) {
-                                return -1;
-                        } else {
-                                return rpc_reconnect_requeue(rpc);
-                        }
+			if (rpc->is_server_context) {
+				return -1;
+			} else {
+				return rpc_reconnect_requeue(rpc);
+			}
 		}
 	}
 
 	if (revents & POLLOUT && rpc_has_queue(&rpc->outqueue)) {
 		if (rpc_write_to_socket(rpc) != 0) {
-                        if (rpc->is_server_context) {
-                                return -1;
-                        } else {
-                                return rpc_reconnect_requeue(rpc);
-                        }
+			if (rpc->is_server_context) {
+				return -1;
+			} else {
+				return rpc_reconnect_requeue(rpc);
+			}
+		}
+	}
+
+	if (rpc->outgoing_calls > 0) {
+		int count = io_uring_submit_and_wait(&rpc->ring, rpc->outgoing_calls);
+		if (count < 0) {
+			rpc_set_error(rpc, "io_uring_submit_and_wait: %s(%d)", strerror(-count), -count);
+			if (rpc->is_server_context) {
+				return -1;
+			} else {
+				return rpc_reconnect_requeue(rpc);
+			}
+		}
+		rpc->outgoing_calls -= count;
+
+		while (count) {
+			count--;
+			struct io_uring_cqe *cqe;
+			int r = io_uring_peek_cqe(&rpc->ring, &cqe);
+			if (r < 0) {
+				rpc_set_error(rpc, "io_uring_peek_cqe: %s(%d)", strerror(-r), -r);
+				if (rpc->is_server_context) {
+					return -1;
+				} else {
+					return rpc_reconnect_requeue(rpc);
+				}
+			}
+
+			if (io_uring_cqe_get_data64(cqe) == 0) {
+				if (rpc_read_complete(rpc, cqe) != 0) {
+					while (io_uring_peek_cqe(&rpc->ring, &cqe) == 0) {
+						io_uring_cqe_seen(&rpc->ring, cqe);
+					}
+					if (rpc->is_server_context) {
+						return -1;
+					} else {
+						return rpc_reconnect_requeue(rpc);
+					}
+				}
+			} else {
+				if (rpc_write_complete(rpc, cqe) != 0) {
+					while (io_uring_peek_cqe(&rpc->ring, &cqe) == 0) {
+						io_uring_cqe_seen(&rpc->ring, cqe);
+					}
+					if (rpc->is_server_context) {
+						return -1;
+					} else {
+						return rpc_reconnect_requeue(rpc);
+					}
+				}
+			}
+		}
+
+		struct rpc_pdu *pdu;
+		while ((pdu = rpc->outqueue.head) != NULL) {
+			if (pdu->written != pdu->outdata.size)
+				break;
+			rpc->outqueue.head = pdu->next;
+			if (pdu->next == NULL)
+				rpc->outqueue.tail = NULL;
+			if (pdu->flags & PDU_DISCARD_AFTER_SENDING) {
+				rpc_free_pdu(rpc, pdu);
+				continue;
+			}
+			rpc_enqueue(&rpc->waitpdu[rpc_hash_xid(pdu->xid)], pdu);
+			rpc->waitpdu_len++;
 		}
 	}
 

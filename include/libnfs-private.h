@@ -35,6 +35,7 @@
 #endif
 
 #include "libnfs-zdr.h"
+#include <liburing.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -122,7 +123,6 @@ struct rpc_context {
 	uint32_t waitpdu_len;
 
 	uint32_t inpos;
-	char rm_buf[4];
 	char *inbuf;
 
 	/* special fields for UDP, which can sometimes be BROADCASTed */
@@ -149,9 +149,12 @@ struct rpc_context {
 	int timeout;
 	char ifname[IFNAMSIZ];
 
-        /* Is a server context ? */
-        int is_server_context;
-        struct rpc_endpoint *endpoints;
+    /* Is a server context ? */
+    int is_server_context;
+    struct rpc_endpoint *endpoints;
+	
+	struct io_uring ring;
+	uint32_t outgoing_calls;
 };
 
 struct rpc_pdu {

@@ -100,6 +100,16 @@ struct rpc_context *rpc_init_context(void)
 	/* Default is no timeout */
 	rpc->timeout = -1;
 
+	rpc->outgoing_calls = 0;
+	if (io_uring_queue_init(256, &rpc->ring, 0)) {
+		return NULL;
+	}
+	rpc->inbuf = malloc(NFS_MAX_XFER_SIZE + 4096);
+	if (rpc->inbuf == NULL) {
+		free(rpc);
+		return NULL;
+	}
+
 	return rpc;
 }
 
@@ -376,6 +386,7 @@ void rpc_destroy_context(struct rpc_context *rpc)
 
 	free(rpc->inbuf);
 	rpc->inbuf = NULL;
+	io_uring_queue_exit(&rpc->ring);
 
 	rpc->magic = 0;
 	free(rpc);
